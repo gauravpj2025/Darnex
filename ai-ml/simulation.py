@@ -549,7 +549,7 @@ def print_simulation_status(tick: int, total_ticks: int, trains: List[Train], we
                   f"⏰ {train.current_delay_minutes:2.0f}min delay")
         else:
             print(f"   {TRAIN_TYPES[train.type]['color']} {train.name:20s} | "
-                  f"📍 Station {train.current_station:2s} | "
+                  f"📍 Station {train.current_station:2d} | "
                   f"📋 {train.status:10s} | "
                   f"⏰ {train.current_delay_minutes:2.0f}min delay | "
                   f"🤖 {train.last_ai_decision or 'N/A':8s}")

@@ -19,16 +19,16 @@ CREATE TABLE IF NOT EXISTS platforms (
     UNIQUE (station_id, platform_no)
 );
 
--- Table: tracks
+-- Table: tracks (Corrected Version)
 CREATE TABLE IF NOT EXISTS tracks (
     id SERIAL PRIMARY KEY,
     from_station INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
     to_station INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
     length_m INTEGER NOT NULL,
     type VARCHAR(50),
-    allowed_speed INTEGER
+    allowed_speed INTEGER,
+    UNIQUE (from_station, to_station) -- <-- ADD THIS LINE
 );
-
 -- Table: crossings
 CREATE TABLE IF NOT EXISTS crossings (
     id SERIAL PRIMARY KEY,

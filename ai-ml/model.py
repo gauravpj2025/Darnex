@@ -4,22 +4,26 @@ import numpy as np
 import joblib
 import networkx as nx
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error, accuracy_score
+from sklearn.preprocessing import LabelEncoder
 import psycopg2
-from psycopg2 import sql
 import os
+import warnings
+import xgboost as xgb
 
-# Define database connection parameters (edit as needed)
+# --- CONFIGURATION ---
 DB_PARAMS = {
     'dbname': 'railway_ai',
     'user': 'postgres',
-    'password': 'pj925fhpp5', # Your actual password
+    'password': 'pj925fhpp5',  # your password
     'host': 'localhost',
     'port': 5432
 }
+MODELS_DIR = 'models'
+os.makedirs(MODELS_DIR, exist_ok=True)
 
-# Create connection
+# --- DATABASE CONNECTION ---
 try:
     conn = psycopg2.connect(**DB_PARAMS)
     print("Database connection successful.")
@@ -27,149 +31,178 @@ except psycopg2.OperationalError as e:
     print(f"Database connection failed: {e}")
     exit()
 
-
 # Helper function to load data from SQL
-def load_data(query):
-    # Added a UserWarning suppression for cleaner output
-    import warnings
+def load_data(query, db_conn):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        return pd.read_sql_query(query, conn)
+        return pd.read_sql_query(query, db_conn)
 
-# Fetch all necessary data
-train_movements = load_data("SELECT * FROM train_movements;")
-trains = load_data("SELECT * FROM trains;")
-stations = load_data("SELECT * FROM stations;")
-tracks = load_data("SELECT * FROM tracks;")
-signals = load_data("SELECT * FROM signals;")
-# <-- FIX: Added timetable_events to get scheduled times
-timetable_events = load_data("SELECT * FROM timetable_events;")
+# --- DATA LOADING ---
+train_movements = load_data("SELECT * FROM train_movements;", conn)
+trains = load_data("SELECT * FROM trains;", conn)
+tracks = load_data("SELECT * FROM tracks;", conn)
+# CORRECTLY load timetable_events
+timetable_events = load_data("SELECT * FROM timetable_events;", conn)
 
-# --- 1. PREPROCESSING FOR DELAY PREDICTION ---
-
-# Check if tables are empty before proceeding
-if train_movements.empty or trains.empty:
-    print("Error: train_movements or trains table is empty. Cannot proceed with training.")
+if train_movements.empty or trains.empty or timetable_events.empty:
+    print("Error: One or more essential tables are empty. Please run generate_data.py.")
     exit()
 
-# <-- FIX: Corrected the merge to use 'id' from the trains table
-df_ma = train_movements.merge(trains, left_on='train_id', right_on='id', how='left')
+# --- 1. PREPROCESSING AND FEATURE ENGINEERING ---
+# Merge train movement with train info
+df = train_movements.merge(trains, left_on='train_id', right_on='id', how='left', suffixes=('_move', '_train'))
 
-# <-- FIX: Merge with timetable_events to get scheduled times
-# This merge is complex; a simple merge on train_id is used for demonstration.
-# A more accurate merge would also involve station and order_no.
-df_ma = df_ma.merge(timetable_events, on='train_id', how='left')
+# Merge timetable data onto the main dataframe
+df = df.merge(timetable_events,
+              left_on=['train_id', 'current_station'],
+              right_on=['train_id', 'station_id'],
+              how='left', suffixes=('_move', '_event'))
 
+# Convert time columns to timezone-aware UTC
+df['actual_arrival'] = pd.to_datetime(df['actual_arrival'], utc=True)
+df['scheduled_arrival'] = pd.to_datetime(df['scheduled_arrival'], utc=True)
 
-# Example feature engineering: convert times, get delay durations
-# <-- FIX: Use actual column names 'actual_arrival' and 'scheduled_arrival'
-df_ma['actual_arrival'] = pd.to_datetime(df_ma['actual_arrival'],utc=True)
-df_ma['scheduled_arrival'] = pd.to_datetime(df_ma['scheduled_arrival'], utc=True)
-# Fill NaNs that result from merges or missing data before calculation
-df_ma['delay_minutes'] = (df_ma['actual_arrival'] - df_ma['scheduled_arrival']).dt.total_seconds() / 60.0
-df_ma['delay_minutes'].fillna(0, inplace=True) # Assume no delay if data is missing
+# Calculate delay
+df['delay_minutes'] = (df['actual_arrival'] - df['scheduled_arrival']).dt.total_seconds() / 60.0
+df['delay_minutes'].fillna(0, inplace=True)
 
-# <-- FIX: Use column names that actually exist in your schema.
-# Removed 'weather_conditions' and 'track_usage' as they don't exist.
-# Renamed 'train_type' to 'type' and 'speed' to 'speed_kmph'.
-# Fill potential NaN values in feature columns
-df_ma['type'].fillna('Unknown', inplace=True)
-df_ma['speed_kmph'].fillna(0, inplace=True)
+# Time-based features
+df['hour_of_day'] = df['actual_arrival'].dt.hour.fillna(0)
+df['day_of_week'] = df['actual_arrival'].dt.dayofweek.fillna(0)
+df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
 
-X_delay = df_ma[['type', 'speed_kmph']].copy()
+# Fill missing values for key columns before creating more features
+df['speed_kmph'].fillna(df['speed_kmph'].mean(), inplace=True)
+df['priority'].fillna(df['priority'].mean(), inplace=True)
+df['type'].fillna('Unknown', inplace=True)
 
-# Convert categorical features
-X_delay = pd.get_dummies(X_delay, columns=['type'], dummy_na=True) # dummy_na handles potential missing values
+# Lag features
+df = df.sort_values(by=['train_id', 'actual_arrival']).reset_index(drop=True)
+df['previous_delay'] = df.groupby('train_id')['delay_minutes'].shift(1).fillna(0)
+df['previous_speed'] = df.groupby('train_id')['speed_kmph'].shift(1).fillna(0)
 
-# Target variable
-y_delay = df_ma['delay_minutes']
-
-# Split data
-X_train_delay, X_test_delay, y_train_delay, y_test_delay = train_test_split(
-    X_delay, y_delay, test_size=0.2, random_state=42)
-
-# --- 2. TRAINING DELAY PREDICTOR (Regression) ---
+# --- 2. TRAIN DELAY PREDICTOR MODEL ---
 print("Training delay prediction model...")
-delay_regressor = RandomForestRegressor(n_estimators=100, n_jobs=-1, random_state=42)
-delay_regressor.fit(X_train_delay, y_train_delay)
 
-# Evaluate
-preds_delay = delay_regressor.predict(X_test_delay)
-mae = mean_absolute_error(y_test_delay, preds_delay)
-print(f"Delay prediction MAE: {mae:.2f} minutes")
+feature_cols = ['speed_kmph', 'priority', 'hour_of_day', 'day_of_week', 'is_weekend',
+                'previous_delay', 'previous_speed']
+target_col = 'delay_minutes'
 
-# Save delay model
-os.makedirs('models', exist_ok=True)
-joblib.dump(delay_regressor, 'models/delay_predictor.pkl')
+# Create a clean DataFrame for the model
+model_df = df[feature_cols + [target_col]].copy()
+model_df.fillna(0, inplace=True)
 
-# --- 3. DELAY REASON CLASSIFICATION ---
-print("Training delay reason classification model...")
-# For demo purposes, create a random label array
-np.random.seed(42)
-df_ma['delay_reason'] = np.random.choice([
-    'signal_failure', 'weather', 'congestion', 'technical_fault', 'crew_issue', 'track_maintenance'], size=len(df_ma))
+X_delay = model_df[feature_cols]
+y_delay = model_df[target_col]
 
-# Encode labels
-from sklearn.preprocessing import LabelEncoder
-le_reason = LabelEncoder()
-df_ma['delay_reason_enc'] = le_reason.fit_transform(df_ma['delay_reason'])
+# Use TimeSeriesSplit for more robust validation
+tscv = TimeSeriesSplit(n_splits=5)
+train_idx, test_idx = list(tscv.split(X_delay))[-1]
+X_train, X_test = X_delay.iloc[train_idx], X_delay.iloc[test_idx]
+y_train, y_test = y_delay.iloc[train_idx], y_delay.iloc[test_idx]
 
-# <-- FIX: Simplified features to use columns that exist in the merged dataframe ('type' and 'status')
-# 'status' is from train_movements, used as a proxy for signal_status.
-df_ma['status'].fillna('Unknown', inplace=True)
-X_reason = pd.get_dummies(df_ma[['type', 'status']], columns=['type', 'status'], dummy_na=True)
-y_reason = df_ma['delay_reason_enc']
+# Train Random Forest
+rf_regressor = RandomForestRegressor(n_estimators=100, n_jobs=-1, random_state=42)
+rf_regressor.fit(X_train, y_train)
+preds_rf = rf_regressor.predict(X_test)
+mae_rf = mean_absolute_error(y_test, preds_rf)
+print(f"Random Forest MAE: {mae_rf:.2f} minutes")
+joblib.dump(rf_regressor, os.path.join(MODELS_DIR, 'delay_predictor.pkl'))
 
-X_train_reason, X_test_reason, y_train_reason, y_test_reason = train_test_split(
-    X_reason, y_reason, test_size=0.2, random_state=42)
+# Train XGBoost
+xgb_model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100, random_state=42)
+xgb_model.fit(X_train, y_train)
+preds_xgb = xgb_model.predict(X_test)
+mae_xgb = mean_absolute_error(y_test, preds_xgb)
+print(f"XGBoost MAE: {mae_xgb:.2f} minutes")
+joblib.dump(xgb_model, os.path.join(MODELS_DIR, 'delay_xgb_model.pkl'))
 
-# Train classifier
-reason_classifier = RandomForestClassifier(n_estimators=100, n_jobs=-1, random_state=42)
-reason_classifier.fit(X_train_reason, y_train_reason)
 
-# Evaluate
-y_pred_reason = reason_classifier.predict(X_test_reason)
-accuracy = accuracy_score(y_test_reason, y_pred_reason)
-print(f"Delay reason classification accuracy: {accuracy:.2f}")
-
-# Save reason classifier
-joblib.dump(reason_classifier, 'models/delay_reason_classifier.pkl')
-joblib.dump(le_reason, 'models/label_encoder_reason.pkl')
-
-# --- 4. DECISION MAKING AI (using rules + Random Forest) ---
-# This part of your code was using simulated data, so it remains unchanged.
-print("Training decision making model...")
-decision_labels = np.random.choice(['hold', 'proceed', 'reroute'], size=1000)
-decision_features = pd.DataFrame({
-    'train_type': np.random.choice(['Passenger', 'Freight'], 1000),
-    'delay_minutes': np.random.uniform(0, 30, 1000),
-    'current_speed': np.random.uniform(20, 120, 1000),
-    'weather': np.random.choice(['Clear', 'Rain', 'Fog'], 1000),
-    'priority': np.random.choice([1,2,3], 1000)
-})
-decision_X = pd.get_dummies(decision_features, columns=['train_type', 'weather'])
-decision_y = pd.Series(decision_labels)
-X_decision_train, X_decision_test, y_decision_train, y_decision_test = train_test_split(
-    decision_X, decision_y, test_size=0.2, random_state=42)
-decision_clf = RandomForestClassifier(n_estimators=100, n_jobs=-1, random_state=42)
-decision_clf.fit(X_decision_train, y_decision_train)
-joblib.dump(decision_clf, 'models/decision_maker.pkl')
-
-# --- 5. ROUTE OPTIMIZATION (using networkx) ---
+# --- 3. BUILD AND SAVE ROUTE OPTIMIZATION GRAPH ---
 print("Building and saving route optimization graph...")
 G = nx.Graph()
-
-# Build graph from stations and tracks
-# <-- FIX: Corrected column names to match the schema
 for index, row in tracks.iterrows():
     G.add_edge(row['from_station'], row['to_station'], length=row['length_m'])
 
-# Save graph as edge list for later
-# (You will need 'import pickle' at the top of your file)
-with open('models/railway_graph.gpickle', 'wb') as f:
+with open(os.path.join(MODELS_DIR, 'railway_graph.gpickle'), 'wb') as f:
     pickle.dump(G, f)
 
 print("\nAll models trained and saved successfully.")
 
+# --- ADD THIS ENTIRE BLOCK TO YOUR model.py FILE ---
+
+# --- 4. TRAIN DECISION MAKING MODEL ---
+print("Training decision making model...")
+
+# First, create the features the model needs
+df['disruption_impact'] = np.random.uniform(0, 1, size=len(df)) # Simulate a disruption score
+
+# Create a more intelligent function to generate the decision labels
+def generate_decision_label(row):
+    """Generates realistic decision labels with a clear 'proceed' condition."""
+    delay = row['delay_minutes']
+    priority = row['priority']
+    disruption = row['disruption_impact']
+
+    # Rule 0: The "All Clear" rule. If there's no disruption and minimal delay, ALWAYS proceed.
+    if disruption < 0.1 and delay < 5:
+        return 'proceed'
+
+    # Rule 1: High-priority trains should try to reroute for major disruptions
+    if priority <= 2 and disruption > 0.7:
+        return 'reroute'
+    
+    # Rule 2: If a track is fully blocked (max disruption), always try to reroute
+    if disruption > 0.95:
+        return 'reroute'
+
+    # Rule 3: If delay is getting high and there's a moderate disruption, hold
+    if delay > 30 and disruption > 0.4:
+        return 'hold'
+    
+    # Rule 4: If already very delayed, hold to avoid causing more problems
+    if delay > 60:
+        return 'hold'
+        
+    # Rule 5: Default to proceed if no other rules match
+    else:
+        return 'proceed'
+
+# Apply the function to create the labels
+df['decision_label'] = df.apply(generate_decision_label, axis=1)
+
+# Encode the text labels into numbers for the model
+le_decision = LabelEncoder()
+df['decision_enc'] = le_decision.fit_transform(df['decision_label'])
+
+# Select the features for the decision model
+decision_features = ['type', 'delay_minutes', 'speed_kmph', 'priority', 
+                     'hour_of_day', 'day_of_week', 'disruption_impact']
+
+# One-hot encode categorical features like 'type'
+X_decision = pd.get_dummies(df[decision_features], columns=['type'], dummy_na=True)
+y_decision = df['decision_enc']
+
+# Fill any missing values
+X_decision.fillna(0, inplace=True)
+
+# Split the data for training and testing
+X_decision_train, X_decision_test, y_decision_train, y_decision_test = train_test_split(
+    X_decision, y_decision, test_size=0.2, shuffle=False) # shuffle=False is good for time-based data
+
+# Train the classifier
+decision_clf = RandomForestClassifier(n_estimators=100, n_jobs=-1, random_state=42)
+decision_clf.fit(X_decision_train, y_decision_train)
+
+# Evaluate the model's accuracy
+pred_decision = decision_clf.predict(X_decision_test)
+acc_decision = accuracy_score(y_decision_test, pred_decision)
+print(f"Decision Model accuracy: {acc_decision:.2f}")
+
+# Save the newly trained, smarter decision model
+joblib.dump(decision_clf, os.path.join(MODELS_DIR, 'decision_maker.pkl'))
+joblib.dump(le_decision, os.path.join(MODELS_DIR, 'label_encoder_decision.pkl')) # Save the encoder too!
+
+# --- END OF THE BLOCK TO ADD ---
 # Close the database connection
 conn.close()

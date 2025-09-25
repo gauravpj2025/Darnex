@@ -19,11 +19,11 @@ INSERT INTO platforms (station_id, platform_no, length_m) VALUES
 ((SELECT id FROM stations WHERE code = 'JP'), '8', 550)
 ON CONFLICT (station_id, platform_no) DO NOTHING;
 
--- Insert Tracks
+-- Insert Tracks (Corrected Version)
 INSERT INTO tracks (from_station, to_station, length_m, type, allowed_speed) VALUES
 ((SELECT id FROM stations WHERE code = 'JP'), (SELECT id FROM stations WHERE code = 'AII'), 135000, 'double-line', 120),
 ((SELECT id FROM stations WHERE code = 'JP'), (SELECT id FROM stations WHERE code = 'NDLS'), 309000, 'double-line', 140)
-ON CONFLICT DO NOTHING;
+ON CONFLICT (from_station, to_station) DO NOTHING; -- <-- SPECIFY THE COLUMNS HERE
 
 -- Insert Trains
 INSERT INTO trains (train_no, name, type, priority, length_m) VALUES
@@ -57,3 +57,33 @@ INSERT INTO timetable_events (train_id, station_id, scheduled_arrival, scheduled
     3
 )
 ON CONFLICT (train_id, order_no) DO NOTHING;
+-- Insert Crossings
+-- Adds a level crossing near Jaipur station
+INSERT INTO crossings (station_id, name, type, controlled) VALUES
+(
+    (SELECT id FROM stations WHERE code = 'JP'), 
+    'Jaipur-Phulera Crossing', 
+    'Level Crossing', 
+    true
+)
+ON CONFLICT (id) DO NOTHING; -- Using a placeholder conflict target as no other unique constraint exists
+
+
+-- Insert Signals
+-- Adds signals on the track between Jaipur and Ajmer
+INSERT INTO signals (signal_code, track_id, location_m, status, type) VALUES
+(
+    'JP_SIG_01',
+    (SELECT id FROM tracks WHERE from_station = (SELECT id FROM stations WHERE code = 'JP') AND to_station = (SELECT id FROM stations WHERE code = 'AII')),
+    500, -- 500m from the start of the track
+    'GREEN',
+    'Automatic'
+),
+(
+    'JP_SIG_02',
+    (SELECT id FROM tracks WHERE from_station = (SELECT id FROM stations WHERE code = 'JP') AND to_station = (SELECT id FROM stations WHERE code = 'AII')),
+    50000, -- 50km from the start of the track
+    'GREEN',
+    'Automatic'
+)
+ON CONFLICT (signal_code) DO NOTHING;
